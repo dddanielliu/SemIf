@@ -33,8 +33,17 @@ def _state_prefix(tokenizer, state) -> list[int]:
     if not payload.startswith(evidence):
         raise ValueError("Evidence serialization changed")
     text = prompt[: prompt.index(payload)] + evidence
-    # Appending JSON punctuation can merge with the final boundary token.
-    return tokenizer.encode(text, add_special_tokens=False)[:-1]
+    # Appending JSON punctuation can merge with the final boundary token. Dropping one token
+    # clears that for most vocabularies, but not all: a state ending in `[]` lets some
+    # tokenizers merge `]}` into a single token, so the trimmed candidate stops being a prefix
+    # of the real prompt. Keep trimming until it demonstrably is one, checked against a full
+    # prompt over this same state. What follows the evidence is always the same punctuation,
+    # so a boundary that holds for the probe holds for every question asked about this state.
+    candidate = tokenizer.encode(text, add_special_tokens=False)[:-1]
+    probe = tokenizer.encode(prompt, add_special_tokens=False)
+    while candidate and probe[: len(candidate)] != candidate:
+        candidate = candidate[:-1]
+    return candidate
 
 
 def _suffix_layout(sequences: list[list[int]], prefix_length: int, pad_id: int):

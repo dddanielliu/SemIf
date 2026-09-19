@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import time
@@ -50,8 +51,36 @@ def _suffix_layout(sequences: list[list[int]], prefix_length: int, pad_id: int):
     return {"input_ids": ids, "attention_mask": masks, "position_ids": positions}, ends
 
 
-def score_shared(model, tokenizer, rows: list[dict], metadata: dict, max_tokens: int = 4096):
-    """Return all option distributions together after one state prefill."""
+class WarmPrefix:
+    """A state prefill kept alive so later batches over the same state can skip it.
+
+    Pass one instance to successive `score_shared` calls. The first call fills it; the rest
+    reuse it and pay only their suffixes. Reuse is refused unless the prefix token sequence is
+    identical, so a changed state silently re-prefills rather than answering against stale
+    evidence. Holding one pins its key/value tensors on the GPU until `release()`.
+    """
+
+    def __init__(self):
+        self.prefix: list[int] | None = None
+        self.cache = None
+        self.reused = 0
+
+    def matches(self, prefix: list[int]) -> bool:
+        return self.cache is not None and self.prefix == prefix
+
+    def release(self) -> None:
+        self.prefix = None
+        self.cache = None
+
+
+def score_shared(
+    model, tokenizer, rows: list[dict], metadata: dict, max_tokens: int = 4096, warm: "WarmPrefix | None" = None
+):
+    """Return all option distributions together after one state prefill.
+
+    `warm` is an optional `WarmPrefix`. Without it the behaviour is unchanged: prefill, score,
+    discard. With it the prefill is reused across calls that share one exact state.
+    """
     import torch
 
     if not rows or any(row["state"] != rows[0]["state"] for row in rows[1:]):
@@ -80,15 +109,23 @@ def score_shared(model, tokenizer, rows: list[dict], metadata: dict, max_tokens:
     with torch.inference_mode():
         sync()
         mark = time.perf_counter()
-        output = model(
-            input_ids=torch.tensor([prefix], dtype=torch.long, device=device),
-            attention_mask=torch.ones((1, len(prefix)), dtype=torch.long, device=device),
-            use_cache=True,
-            return_dict=True,
-            logits_to_keep=1,
-        )
-        cache = output.past_key_values
-        del output
+        if warm is not None and warm.matches(prefix):
+            # Branch from the pristine copy. The stored cache is never advanced: a hybrid
+            # model's recurrent layers absorb the suffix irreversibly, so it cannot be rewound.
+            cache = copy.deepcopy(warm.cache)
+            warm.reused += 1
+        else:
+            output = model(
+                input_ids=torch.tensor([prefix], dtype=torch.long, device=device),
+                attention_mask=torch.ones((1, len(prefix)), dtype=torch.long, device=device),
+                use_cache=True,
+                return_dict=True,
+                logits_to_keep=1,
+            )
+            cache = output.past_key_values
+            del output
+            if warm is not None:
+                warm.prefix, warm.cache = prefix, copy.deepcopy(cache)
         sync()
         prefill_seconds = time.perf_counter() - mark
         if cache is None or cache.get_seq_length() != len(prefix):

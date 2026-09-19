@@ -17,11 +17,12 @@ ordering depends on which other options shared its prompt.
 
 from __future__ import annotations
 
+import inspect
 import math
 import time
 
 from .core import LETTERS
-from .shared import score_shared
+from .shared import WarmPrefix, score_shared
 
 MAX_SLOTS = len(LETTERS)
 SEPARATOR = "\x1f"
@@ -125,48 +126,56 @@ def score_options(
             pools[identifier] = ids
 
     rounds_run, batches_run, prefill_tokens, suffix_tokens = 0, 0, 0, 0
-    while pools:
-        planned = []
-        for identifier, pool in pools.items():
-            for group in partition(pool, max_slots):
-                planned.append((identifier, group))
-        rows = [
-            {
-                "id": f"{identifier}{SEPARATOR}{rounds_run}{SEPARATOR}{index}",
-                "state": state,
-                "question": questions[identifier],
-                "options": [{"id": option, "description": catalog[identifier][option]} for option in group],
-            }
-            for index, (identifier, group) in enumerate(planned)
-        ]
-        width = max_batch or len(rows)
-        scored = {}
-        for start in range(0, len(rows), width):
-            chunk = rows[start : start + width]
-            results, timing = scorer(model, tokenizer, chunk, metadata, max_tokens)
-            batches_run += 1
-            prefill_tokens += timing.get("prefix_tokens", 0)
-            suffix_tokens += timing.get("true_suffix_tokens", 0)
-            scored.update({result["id"]: result for result in results})
+    # Every batch here scores the same state, so the prefill is computed once and reused
+    # across rounds. A scorer that does not understand a warm prefix never sees one.
+    warm = WarmPrefix() if "warm" in inspect.signature(scorer).parameters else None
+    extra = {"warm": warm} if warm is not None else {}
+    try:
+        while pools:
+            planned = []
+            for identifier, pool in pools.items():
+                for group in partition(pool, max_slots):
+                    planned.append((identifier, group))
+            rows = [
+                {
+                    "id": f"{identifier}{SEPARATOR}{rounds_run}{SEPARATOR}{index}",
+                    "state": state,
+                    "question": questions[identifier],
+                    "options": [{"id": option, "description": catalog[identifier][option]} for option in group],
+                }
+                for index, (identifier, group) in enumerate(planned)
+            ]
+            width = max_batch or len(rows)
+            scored = {}
+            for start in range(0, len(rows), width):
+                chunk = rows[start : start + width]
+                results, timing = scorer(model, tokenizer, chunk, metadata, max_tokens, **extra)
+                batches_run += 1
+                prefill_tokens += timing.get("prefix_tokens", 0)
+                suffix_tokens += timing.get("true_suffix_tokens", 0)
+                scored.update({result["id"]: result for result in results})
 
-        advancing = {}
-        for row, (identifier, group) in zip(rows, planned):
-            result = scored[row["id"]]
-            probabilities = list(result["probabilities"])
-            if len(probabilities) != len(group):
-                raise RuntimeError(f"Scorer returned {len(probabilities)} scores for {len(group)} options")
-            advancing.setdefault(identifier, []).append(
-                {"option_ids": list(group), "probabilities": probabilities, "winner": _winner(group, probabilities)}
-            )
+            advancing = {}
+            for row, (identifier, group) in zip(rows, planned):
+                result = scored[row["id"]]
+                probabilities = list(result["probabilities"])
+                if len(probabilities) != len(group):
+                    raise RuntimeError(f"Scorer returned {len(probabilities)} scores for {len(group)} options")
+                advancing.setdefault(identifier, []).append(
+                    {"option_ids": list(group), "probabilities": probabilities, "winner": _winner(group, probabilities)}
+                )
 
-        pools = {}
-        for identifier, groups in advancing.items():
-            history[identifier].append(groups)
-            if len(groups) == 1:
-                settled[identifier] = marginals(history[identifier])
-            else:
-                pools[identifier] = [group["winner"] for group in groups]
-        rounds_run += 1
+            pools = {}
+            for identifier, groups in advancing.items():
+                history[identifier].append(groups)
+                if len(groups) == 1:
+                    settled[identifier] = marginals(history[identifier])
+                else:
+                    pools[identifier] = [group["winner"] for group in groups]
+            rounds_run += 1
+    finally:
+        if warm is not None:
+            warm.release()
 
     results = []
     for decision in decisions:

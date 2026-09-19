@@ -119,3 +119,26 @@ def test_single_option_decision_never_reaches_the_scorer():
 def test_duplicate_identifiers_are_rejected():
     with pytest.raises(ValueError):
         score_options(None, None, "s", [decision("d", 3), decision("d", 3)], {}, scorer=fake_scorer({}))
+
+
+def test_a_warm_prefix_is_offered_to_scorers_that_accept_one():
+    """The default scorer reuses one prefill across rounds; a plain scorer never sees it."""
+    seen = []
+
+    def warm_aware(_model, _tokenizer, rows, _metadata, _max_tokens, warm=None):
+        seen.append(warm)
+        return (
+            [{"id": row["id"], "probabilities": [1 / len(row["options"])] * len(row["options"])} for row in rows],
+            {"prefix_tokens": 5, "true_suffix_tokens": 1},
+        )
+
+    score_options(None, None, "s", [decision("d", 40)], {}, max_slots=16, scorer=warm_aware)
+    assert len(seen) == 2, "two rounds"
+    assert seen[0] is seen[1] is not None, "the same warm prefix spans both rounds"
+    assert seen[0].prefix is None, "released once the decision is done"
+
+
+def test_a_plain_scorer_is_called_without_a_warm_prefix():
+    scorer = fake_scorer({f"o{index}": 1.0 for index in range(40)})
+    score_options(None, None, "s", [decision("d", 40)], {}, max_slots=16, scorer=scorer)
+    assert len(scorer.calls) == 2

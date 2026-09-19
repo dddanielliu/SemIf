@@ -39,8 +39,12 @@ def encode_prompt(tokenizer, row: dict, max_tokens: int) -> tuple[list[int], lis
     if not ids or len(ids) > max_tokens:
         raise ValueError(f"Row {row['id']}: {len(ids)} input tokens exceed limit {max_tokens}; no truncation allowed")
     slots = _slot_ids(tokenizer, len(row["options"]))
-    for letter, token in zip(LETTERS, slots):
-        if tokenizer.encode(prompt + letter, add_special_tokens=False) != ids + [token]:
+    # One batched call rather than one per slot. A fast tokenizer encodes the batch in
+    # parallel, and re-encoding a long prompt once per option dominated short decisions.
+    letters = LETTERS[: len(slots)]
+    variants = tokenizer([prompt + letter for letter in letters], add_special_tokens=False)["input_ids"]
+    for letter, token, variant in zip(letters, slots, variants):
+        if list(variant) != ids + [token]:
             raise ValueError(f"Answer boundary changes tokenization for slot {letter}")
     return ids, slots, digest(prompt)
 
